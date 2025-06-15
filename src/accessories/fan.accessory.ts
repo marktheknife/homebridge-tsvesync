@@ -42,6 +42,10 @@ export class FanAccessory extends BaseAccessory {
   protected readonly device: VeSyncFan;
   private readonly capabilities: DeviceCapabilities;
   private readonly speedLevels: number[];
+  private timerService?: any;
+  private displayService?: any;
+  private temperatureService?: any;
+  private humidityService?: any;
 
   constructor(
     platform: TSVESyncPlatform,
@@ -64,6 +68,19 @@ export class FanAccessory extends BaseAccessory {
       this.platform.Characteristic.Active,
       this.getActive.bind(this),
       this.setActive.bind(this)
+    );
+
+    // Add CurrentFanState characteristic
+    this.setupCharacteristic(
+      this.platform.Characteristic.CurrentFanState,
+      this.getCurrentFanState.bind(this)
+    );
+
+    // Add TargetFanState characteristic
+    this.setupCharacteristic(
+      this.platform.Characteristic.TargetFanState,
+      this.getTargetFanState.bind(this),
+      this.setTargetFanState.bind(this)
     );
 
     // Set up speed control
@@ -108,6 +125,14 @@ export class FanAccessory extends BaseAccessory {
       this.platform.Characteristic.Name,
       async () => this.device.deviceName
     );
+
+    // Add timer service for tower fans
+    if (this.device.deviceType.startsWith('LTF-')) {
+      this.setupTimerService();
+      this.setupDisplayService();
+      this.setupTemperatureService();
+      this.setupHumidityService();
+    }
   }
 
   /**
@@ -131,7 +156,13 @@ export class FanAccessory extends BaseAccessory {
     // Update current state (INACTIVE = 0, IDLE = 1, BLOWING_AIR = 2)
     this.updateCharacteristicValue(
       this.platform.Characteristic.CurrentFanState,
-      isActive ? 2 : 0
+      isActive ? (fanDetails.speed > 0 ? 2 : 1) : 0
+    );
+
+    // Update target fan state (MANUAL = 0, AUTO = 1)
+    this.updateCharacteristicValue(
+      this.platform.Characteristic.TargetFanState,
+      fanDetails.mode === 'auto' ? 1 : 0
     );
 
     // Update rotation speed
@@ -163,6 +194,38 @@ export class FanAccessory extends BaseAccessory {
       modeService.setCharacteristic(
         this.platform.Characteristic.On,
         this.getModeValue(fanDetails.mode)
+      );
+    }
+
+    // Update timer service if it exists
+    if (this.timerService && 'timer' in details) {
+      this.timerService.updateCharacteristic(
+        this.platform.Characteristic.On,
+        details.timer > 0
+      );
+    }
+
+    // Update display service if it exists
+    if (this.displayService && 'displayState' in details) {
+      this.displayService.updateCharacteristic(
+        this.platform.Characteristic.On,
+        details.displayState
+      );
+    }
+
+    // Update temperature sensor if it exists
+    if (this.temperatureService && 'temperature' in details) {
+      this.temperatureService.updateCharacteristic(
+        this.platform.Characteristic.CurrentTemperature,
+        details.temperature / 10
+      );
+    }
+
+    // Update humidity sensor if it exists
+    if (this.humidityService && 'humidity' in details) {
+      this.humidityService.updateCharacteristic(
+        this.platform.Characteristic.CurrentRelativeHumidity,
+        details.humidity
       );
     }
   }
@@ -308,20 +371,21 @@ export class FanAccessory extends BaseAccessory {
     }
   }
 
-  private getModeValue(mode: 'normal' | 'auto' | 'sleep' | 'turbo'): number {
+  private getModeValue(mode: 'normal' | 'auto' | 'sleep' | 'turbo' | 'advancedSleep'): number {
     switch (mode) {
       case 'normal': return MODE_NORMAL;
       case 'auto': return MODE_AUTO;
-      case 'sleep': return MODE_SLEEP;
+      case 'sleep': 
+      case 'advancedSleep': return MODE_SLEEP;
       case 'turbo': return MODE_TURBO;
       default: return MODE_NORMAL;
     }
   }
 
-  private getModeString(value: number): 'normal' | 'auto' | 'sleep' | 'turbo' {
+  private getModeString(value: number): 'normal' | 'auto' | 'sleep' | 'turbo' | 'advancedSleep' {
     switch (value) {
       case MODE_AUTO: return 'auto';
-      case MODE_SLEEP: return 'sleep';
+      case MODE_SLEEP: return 'advancedSleep'; // Tower fans use advancedSleep
       case MODE_TURBO: return 'turbo';
       default: return 'normal';
     }
@@ -344,5 +408,127 @@ export class FanAccessory extends BaseAccessory {
     } catch (error) {
       this.handleDeviceError('set mode', error);
     }
+  }
+
+  private async getCurrentFanState(): Promise<CharacteristicValue> {
+    // INACTIVE = 0, IDLE = 1, BLOWING_AIR = 2
+    if (this.device.deviceStatus !== 'on') {
+      return 0; // INACTIVE
+    }
+    return this.device.speed > 0 ? 2 : 1; // BLOWING_AIR or IDLE
+  }
+
+  private async getTargetFanState(): Promise<CharacteristicValue> {
+    // MANUAL = 0, AUTO = 1
+    return this.device.mode === 'auto' ? 1 : 0;
+  }
+
+  private async setTargetFanState(value: CharacteristicValue): Promise<void> {
+    try {
+      const targetState = value as number;
+      const mode = targetState === 1 ? 'auto' : 'normal';
+      const success = await this.device.setMode(mode);
+      
+      if (!success) {
+        throw new Error(`Failed to set target fan state to ${targetState === 1 ? 'AUTO' : 'MANUAL'}`);
+      }
+      
+      await this.persistDeviceState('mode', mode);
+    } catch (error) {
+      this.handleDeviceError('set target fan state', error);
+    }
+  }
+
+  private setupTimerService(): void {
+    this.timerService = this.accessory.getService('Timer') ||
+      this.accessory.addService(this.platform.Service.Switch, 'Timer', 'timer');
+
+    this.timerService.getCharacteristic(this.platform.Characteristic.On)
+      .onGet(async () => {
+        try {
+          return (this.device as any).timer > 0;
+        } catch {
+          return false;
+        }
+      })
+      .onSet(async (value: CharacteristicValue) => {
+        try {
+          if (value && (this.device as any).setTimer) {
+            // Set timer for 1 hour as default
+            await (this.device as any).setTimer(1);
+          } else if (!value && (this.device as any).clearTimer) {
+            await (this.device as any).clearTimer();
+          }
+        } catch (error) {
+          this.handleDeviceError('set timer', error);
+        }
+      });
+  }
+
+  private setupDisplayService(): void {
+    this.displayService = this.accessory.getService('Display') ||
+      this.accessory.addService(this.platform.Service.Switch, 'Display', 'display');
+
+    this.displayService.getCharacteristic(this.platform.Characteristic.On)
+      .onGet(async () => {
+        try {
+          return (this.device as any).displayState || false;
+        } catch {
+          return false;
+        }
+      })
+      .onSet(async (value: CharacteristicValue) => {
+        try {
+          if ((this.device as any).setDisplay) {
+            await (this.device as any).setDisplay(value as boolean);
+          }
+        } catch (error) {
+          this.handleDeviceError('set display', error);
+        }
+      });
+  }
+
+  private setupTemperatureService(): void {
+    if (!(this.device as any).temperature) {
+      return;
+    }
+
+    this.temperatureService = this.accessory.getService(this.platform.Service.TemperatureSensor) ||
+      this.accessory.addService(this.platform.Service.TemperatureSensor, 'Temperature', 'temperature');
+
+    this.temperatureService.getCharacteristic(this.platform.Characteristic.CurrentTemperature)
+      .onGet(async () => {
+        try {
+          const temp = (this.device as any).temperature;
+          // Temperature is stored in tenths of a degree
+          return temp ? temp / 10 : 20;
+        } catch {
+          return 20;
+        }
+      });
+
+    // Link the temperature sensor to the main fan service
+    this.service.addLinkedService(this.temperatureService);
+  }
+
+  private setupHumidityService(): void {
+    if (!(this.device as any).humidity) {
+      return;
+    }
+
+    this.humidityService = this.accessory.getService(this.platform.Service.HumiditySensor) ||
+      this.accessory.addService(this.platform.Service.HumiditySensor, 'Humidity', 'humidity');
+
+    this.humidityService.getCharacteristic(this.platform.Characteristic.CurrentRelativeHumidity)
+      .onGet(async () => {
+        try {
+          return (this.device as any).humidity || 50;
+        } catch {
+          return 50;
+        }
+      });
+
+    // Link the humidity sensor to the main fan service
+    this.service.addLinkedService(this.humidityService);
   }
 } 

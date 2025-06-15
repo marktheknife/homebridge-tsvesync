@@ -78,10 +78,20 @@ export interface VeSyncHumidifier extends VeSyncDeviceWithPower, VeSyncDeviceWit
 export interface VeSyncFan extends VeSyncDeviceWithPower, VeSyncDeviceWithSpeed, VeSyncDeviceWithRotation {
   oscillationState: boolean;
   childLock: boolean;
-  mode: 'normal' | 'auto' | 'sleep' | 'turbo';
+  mode: 'normal' | 'auto' | 'sleep' | 'turbo' | 'advancedSleep';
+  timer?: number;
+  displayState?: boolean;
+  temperature?: number;
+  humidity?: number;
+  thermalComfort?: string;
   setOscillation(enabled: boolean): Promise<boolean>;
   setChildLock(enabled: boolean): Promise<boolean>;
-  setMode(mode: 'normal' | 'auto' | 'sleep' | 'turbo'): Promise<boolean>;
+  setMode(mode: 'normal' | 'auto' | 'sleep' | 'turbo' | 'advancedSleep'): Promise<boolean>;
+  setTimer?(hours: number): Promise<boolean>;
+  clearTimer?(): Promise<boolean>;
+  setDisplay?(enabled: boolean): Promise<boolean>;
+  turnOnDisplay?(): Promise<boolean>;
+  turnOffDisplay?(): Promise<boolean>;
 }
 
 export interface VeSyncBulb extends VeSyncDeviceWithPower, VeSyncDeviceWithBrightness, VeSyncDeviceWithColor {}
